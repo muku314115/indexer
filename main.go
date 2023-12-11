@@ -153,6 +153,7 @@ func getCirculatingSupply() http.HandlerFunc {
 			)
 			if err != nil {
 				safe = false
+				fmt.Println("encountered error: " + err.Error())
 				return
 			}
 			response := authtypes.QueryAccountsResponse{}
