@@ -12,12 +12,11 @@ import (
 	authtypes "github.com/cosmos/cosmos-sdk/x/auth/types"
 	banktypes "github.com/cosmos/cosmos-sdk/x/bank/types"
 	"github.com/gorilla/mux"
-	"io/ioutil"
-	"sync"
-
 	rpcclient "github.com/tendermint/tendermint/rpc/client"
 	tmhttp "github.com/tendermint/tendermint/rpc/client/http"
 	libclient "github.com/tendermint/tendermint/rpc/jsonrpc/client"
+	"io/ioutil"
+	"sync"
 
 	"net/http"
 	"time"
@@ -56,7 +55,7 @@ func main() {
 	r.HandleFunc("/circulatingsupply/{denom}", getCirculatingSupply())
 
 	server := &http.Server{
-		Addr:              ":8090",
+		Addr:              ":8000",
 		Handler:           r,
 		ReadHeaderTimeout: 10000 * time.Second,
 	}
@@ -69,6 +68,7 @@ func main() {
 
 func getCirculatingSupply() http.HandlerFunc {
 	return func(w http.ResponseWriter, req *http.Request) {
+		var wg sync.WaitGroup
 		client, err := NewRPCClient("https://terra-classic-rpc.publicnode.com:443", 30*time.Second)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -79,83 +79,70 @@ func getCirculatingSupply() http.HandlerFunc {
 		authtypes.RegisterInterfaces(interfaceRegistry)
 		marshaler := codec.NewProtoCodec(interfaceRegistry)
 
-		var mu sync.Mutex
 		amt := math.NewInt(0)
 
-		var next []byte
-
 		// Define a function to process accounts
-		processAccounts := func(accounts []*cdctypes.Any) {
-			var wg sync.WaitGroup
-			defer wg.Wait()
+		processAccount := func(i *cdctypes.Any, resultsCh chan<- math.Int) {
+			defer wg.Done()
 
-			for _, i := range accounts {
-				if i == nil {
-					continue
+			if i == nil {
+				return
+			}
+
+			var acc types.AccountI
+			if err := marshaler.InterfaceRegistry().UnpackAny(i, &acc); err != nil {
+				return
+			}
+
+			resp, err := http.Get(fmt.Sprintf("%s%s", FCD_URI, acc.GetAddress().String()))
+			if err != nil {
+				return
+			}
+			defer resp.Body.Close()
+
+			body, err := ioutil.ReadAll(resp.Body)
+			if err != nil {
+				return
+			}
+
+			txsList := &TxsListResponse{}
+			if err := json.Unmarshal(body, txsList); err != nil {
+				return
+			}
+
+			if len(txsList.Txs) == 0 || !isTimestampWithinAYear(txsList.Txs[0].Timestamp) {
+				return
+			}
+
+			bankquery := banktypes.QueryAllBalancesRequest{Address: acc.GetAddress().String()}
+			bytes := marshaler.MustMarshal(&bankquery)
+
+			abciquery, err := client.ABCIQueryWithOptions(
+				context.Background(),
+				"/cosmos.bank.v1beta1.Query/AllBalances",
+				bytes,
+				rpcclient.ABCIQueryOptions{},
+			)
+			if err != nil {
+				return
+			}
+
+			var bankQueryResponse banktypes.QueryAllBalancesResponse
+			if err := marshaler.Unmarshal(abciquery.Response.Value, &bankQueryResponse); err != nil {
+				return
+			}
+
+			for _, bal := range bankQueryResponse.Balances {
+				if bal.GetDenom() == mux.Vars(req)["denom"] {
+					resultsCh <- bal.Amount
 				}
-
-				wg.Add(1)
-				go func(i *cdctypes.Any) {
-					defer wg.Done()
-
-					var acc types.AccountI
-					if err := marshaler.InterfaceRegistry().UnpackAny(i, &acc); err != nil {
-						return
-					}
-
-					resp, err := http.Get(fmt.Sprintf("%s%s", FCD_URI, acc.GetAddress().String()))
-					if err != nil {
-						return
-					}
-					defer resp.Body.Close()
-
-					body, err := ioutil.ReadAll(resp.Body)
-					if err != nil {
-						return
-					}
-
-					txsList := &TxsListResponse{}
-					if err := json.Unmarshal(body, txsList); err != nil {
-						return
-					}
-
-					if len(txsList.Txs) > 0 && !isTimestampWithinAYear(txsList.Txs[0].Timestamp) {
-						return
-					}
-
-					bankquery := banktypes.QueryAllBalancesRequest{Address: acc.GetAddress().String()}
-					bytes := marshaler.MustMarshal(&bankquery)
-
-					abciquery, err := client.ABCIQueryWithOptions(
-						context.Background(),
-						"/cosmos.bank.v1beta1.Query/AllBalances",
-						bytes,
-						rpcclient.ABCIQueryOptions{},
-					)
-					if err != nil {
-						return
-					}
-
-					var bankQueryResponse banktypes.QueryAllBalancesResponse
-					if err := marshaler.Unmarshal(abciquery.Response.Value, &bankQueryResponse); err != nil {
-						return
-					}
-
-					mu.Lock()
-					defer mu.Unlock()
-
-					for _, bal := range bankQueryResponse.Balances {
-						if bal.GetDenom() == mux.Vars(req)["denom"] {
-							amt.Add(bal.Amount)
-						}
-					}
-				}(i)
 			}
 		}
 
-		// Fetch accounts in batches
-		for {
-			query := authtypes.QueryAccountsRequest{Pagination: &query2.PageRequest{Limit: 10000, Key: next}}
+		offset := uint64(0)
+		ch := make(chan *cdctypes.Any)
+		safe := true
+		processQuery := func(query authtypes.QueryAccountsRequest, ch chan<- *cdctypes.Any) {
 			bytes := marshaler.MustMarshal(&query)
 
 			abciquery, err := client.ABCIQueryWithOptions(
@@ -165,25 +152,57 @@ func getCirculatingSupply() http.HandlerFunc {
 				rpcclient.ABCIQueryOptions{},
 			)
 			if err != nil {
-				http.Error(w, err.Error(), http.StatusInternalServerError)
+				safe = false
 				return
 			}
-
 			response := authtypes.QueryAccountsResponse{}
 			marshaler.Unmarshal(abciquery.Response.Value, &response)
-
-			next = response.Pagination.NextKey
-
-			// Process accounts in parallel
-			processAccounts(response.Accounts)
-
-			fmt.Println(next)
-
-			if next == nil {
-				break
+			fmt.Println("Response")
+			fmt.Println(response.String())
+			// Send individual accounts to accCh
+			for _, acc := range response.Accounts {
+				ch <- acc
 			}
 		}
 
+		for safe {
+			query := authtypes.QueryAccountsRequest{Pagination: &query2.PageRequest{Limit: 10000, Offset: offset}}
+			wg.Add(1)
+			go processQuery(query, ch)
+			offset += 10000
+		}
+
+		// Start a goroutine to close the results channel when all processing is done
+		go func() {
+			wg.Wait()
+			close(ch)
+			fmt.Println("Queries processed")
+		}()
+
+		// Use a channel to collect individual results
+		resultsCh := make(chan math.Int)
+
+		// Process accounts concurrently
+		for i := range ch {
+			wg.Add(1)
+			go processAccount(i, resultsCh)
+		}
+
+		// Start a goroutine to close the results channel when all processing is done
+		go func() {
+			wg.Wait()
+			close(resultsCh)
+			fmt.Println("Results processed")
+		}()
+
+		// Collect individual results and sum them up
+		for individualAmt := range resultsCh {
+			//mu.Lock()
+			amt.Add(individualAmt)
+			//mu.Unlock()
+		}
+
+		// Print or use the final result (amt)
 		fmt.Fprint(w, amt.String())
 	}
 }
