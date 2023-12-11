@@ -171,6 +171,9 @@ func getCirculatingSupply() http.HandlerFunc {
 			wg.Add(1)
 			go processQuery(query, ch)
 			offset += 10000
+			if offset == 100000 {
+				return
+			}
 		}
 
 		// Start a goroutine to close the results channel when all processing is done
